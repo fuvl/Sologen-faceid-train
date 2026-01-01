@@ -42,22 +42,34 @@ class TrainConfig:
     prompt_mode: str
     prompt_cache_size: int
     text_encoder_on_cpu: bool
+    token_scale: float
+    grad_clip: float
 
 
 class ZImageFaceIDAdapter(nn.Module):
-    def __init__(self, face_dim: int = 512, embed_dim: int = 2560, token_count: int = 4, hidden_dim: int = 1024):
+    def __init__(
+        self,
+        face_dim: int = 512,
+        embed_dim: int = 2560,
+        token_count: int = 4,
+        hidden_dim: int = 1024,
+        token_scale: float = 0.01,
+    ):
         super().__init__()
         self.token_count = token_count
         self.embed_dim = embed_dim
-        self.net = nn.Sequential(
-            nn.Linear(face_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, token_count * embed_dim),
-        )
+        self.token_scale = float(token_scale)
+
+        out = nn.Linear(hidden_dim, token_count * embed_dim)
+        # Start from a near-no-op: initial FaceID tokens should not destabilize the frozen base model.
+        nn.init.zeros_(out.weight)
+        nn.init.zeros_(out.bias)
+        self.net = nn.Sequential(nn.Linear(face_dim, hidden_dim), nn.SiLU(), out)
 
     def forward(self, face_embedding: torch.Tensor) -> torch.Tensor:
         # face_embedding: [B, 512]
         out = self.net(face_embedding)  # [B, token_count*embed_dim]
+        out = out * self.token_scale
         return out.view(face_embedding.shape[0], self.token_count, self.embed_dim)
 
 
@@ -370,6 +382,17 @@ class _ZImageTextEncoder:
         return emb_cpu.to(self._device, dtype=dtype, non_blocking=True)
 
 
+def _tensor_stats(name: str, t: torch.Tensor) -> str:
+    t = t.detach()
+    t32 = t.float()
+    nan = torch.isnan(t32).sum().item()
+    inf = torch.isinf(t32).sum().item()
+    mn = t32.amin().item()
+    mx = t32.amax().item()
+    mean = t32.mean().item()
+    return f"{name}: min={mn:.6g} max={mx:.6g} mean={mean:.6g} nan={nan} inf={inf} shape={list(t.shape)} dtype={t.dtype}"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a Z-Image FaceID adapter (scaffold).")
     parser.add_argument("--repo", default="Tongyi-MAI/Z-Image-Turbo")
@@ -417,6 +440,18 @@ def main() -> None:
         "--text-encoder-on-cpu",
         action="store_true",
         help="Run the Z-Image text encoder on CPU to reduce GPU memory usage (slower).",
+    )
+    parser.add_argument(
+        "--token-scale",
+        type=float,
+        default=0.01,
+        help="Initial scale factor for adapter-produced FaceID tokens (smaller = more stable).",
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        default=1.0,
+        help="Max grad norm for adapter params (<=0 disables).",
     )
     args = parser.parse_args()
 
@@ -479,6 +514,8 @@ def main() -> None:
         prompt_mode=args.prompt_mode or ("celeba_attrs" if args.hf_dataset else "zeros"),
         prompt_cache_size=args.prompt_cache_size,
         text_encoder_on_cpu=args.text_encoder_on_cpu,
+        token_scale=args.token_scale,
+        grad_clip=args.grad_clip,
     )
 
     ds = None
@@ -511,6 +548,8 @@ def main() -> None:
     print(f"[train] prompt_mode={cfg.prompt_mode}")
     print(f"[train] prompt_cache_size={cfg.prompt_cache_size}")
     print(f"[train] text_encoder_on_cpu={cfg.text_encoder_on_cpu}")
+    print(f"[train] token_scale={cfg.token_scale}")
+    print(f"[train] grad_clip={cfg.grad_clip}")
     print(f"[train] out={cfg.output}")
 
     # Load base models (frozen).
@@ -573,7 +612,7 @@ def main() -> None:
         ]
     )
 
-    adapter = ZImageFaceIDAdapter(token_count=cfg.token_count).to(cfg.device)
+    adapter = ZImageFaceIDAdapter(token_count=cfg.token_count, token_scale=cfg.token_scale).to(cfg.device)
     opt = torch.optim.AdamW(adapter.parameters(), lr=cfg.lr)
 
     base_prompt = torch.zeros((cfg.prompt_len, 2560), device=cfg.device, dtype=transformer.dtype)
@@ -650,7 +689,7 @@ def main() -> None:
         while sigma.ndim < latents.ndim:
             sigma = sigma.unsqueeze(-1)
         noisy_latents = (1.0 - sigma) * latents + sigma * noise
-        target_v = noise - latents
+        target_v = (noise.float() - latents.float()).to(device=cfg.device)
 
         t = (1.0 - sigma.flatten()).to(torch.float32)  # normalized time [0,1]
 
@@ -660,10 +699,20 @@ def main() -> None:
         out = torch.stack(out_list, dim=0).squeeze(2).float()
 
         # Pipeline negates model output before scheduler step.
-        pred_v = (-out).to(dtype=target_v.dtype)
-
+        pred_v = -out  # keep fp32 for stable loss
         loss = torch.mean((pred_v - target_v) ** 2)
+        if not torch.isfinite(loss).item():
+            print("[train] ERROR: non-finite loss; aborting.")
+            print(_tensor_stats("latents", latents))
+            print(_tensor_stats("noise", noise))
+            print(_tensor_stats("noisy_latents", noisy_latents))
+            print(_tensor_stats("tokens", tokens))
+            print(_tensor_stats("out", out))
+            print(_tensor_stats("target_v", target_v))
+            raise SystemExit(2)
         loss.backward()
+        if cfg.grad_clip and cfg.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), cfg.grad_clip)
         opt.step()
 
         if (step + 1) % 5 == 0 or step == 0:
