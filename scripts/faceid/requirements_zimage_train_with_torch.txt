@@ -1,0 +1,7 @@
+-r requirements_zimage_train.txt
+
+# For local (non-Vast) setups that don't come with torch preinstalled.
+# On CUDA machines, prefer installing torch from the official PyTorch CUDA index
+# rather than relying on a CPU-only wheel.
+torch==2.4.0
+torchvision==0.19.0

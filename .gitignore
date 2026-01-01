@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# Virtualenvs
+.venv/
+venv/
+
+# Local artifacts
+build-tools/
+
+# Downloads / datasets
+hf-cache/
+cache/
+*.safetensors
+*.ckpt
+*.bin
+*.pt
+
+# Outputs
+*.pth
+*.mlmodel
+*.mlpackage

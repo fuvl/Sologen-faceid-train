@@ -1,0 +1,10 @@
+accelerate==1.2.1
+einops==0.8.0
+datasets==3.2.0
+safetensors==0.4.5
+pillow==11.0.0
+transformers==4.57.3
+tokenizers==0.22.1
+huggingface-hub==0.36.0
+# Z-Image pipeline lives on a diffusers dev snapshot.
+git+https://github.com/huggingface/diffusers.git@1cdb8723b85f1b427031e390e0bd0bebfe92454e#egg=diffusers
