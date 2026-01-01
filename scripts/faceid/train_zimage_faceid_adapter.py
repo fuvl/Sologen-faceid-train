@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import random
 import sys
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,6 +45,9 @@ class TrainConfig:
     text_encoder_on_cpu: bool
     token_scale: float
     grad_clip: float
+    gradient_checkpointing: bool
+    resume: Path | None
+    save_every: int
 
 
 class ZImageFaceIDAdapter(nn.Module):
@@ -453,6 +457,22 @@ def main() -> None:
         default=1.0,
         help="Max grad norm for adapter params (<=0 disables).",
     )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing in the frozen transformer (saves memory, slower).",
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Optional path to an existing adapter checkpoint (.pth) to resume from.",
+    )
+    parser.add_argument(
+        "--save-every",
+        type=int,
+        default=500,
+        help="Checkpoint every N steps (<=0 disables periodic saves).",
+    )
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[2]
@@ -516,6 +536,9 @@ def main() -> None:
         text_encoder_on_cpu=args.text_encoder_on_cpu,
         token_scale=args.token_scale,
         grad_clip=args.grad_clip,
+        gradient_checkpointing=args.gradient_checkpointing,
+        resume=(Path(args.resume).expanduser().resolve() if args.resume else None),
+        save_every=int(args.save_every),
     )
 
     ds = None
@@ -550,6 +573,9 @@ def main() -> None:
     print(f"[train] text_encoder_on_cpu={cfg.text_encoder_on_cpu}")
     print(f"[train] token_scale={cfg.token_scale}")
     print(f"[train] grad_clip={cfg.grad_clip}")
+    print(f"[train] gradient_checkpointing={cfg.gradient_checkpointing}")
+    print(f"[train] resume={cfg.resume}")
+    print(f"[train] save_every={cfg.save_every}")
     print(f"[train] out={cfg.output}")
 
     # Load base models (frozen).
@@ -562,7 +588,8 @@ def main() -> None:
         low_cpu_mem_usage=True,
     ).to(cfg.device)
     transformer.eval()
-    transformer.enable_gradient_checkpointing()
+    if cfg.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
     if cfg.attention_backend:
         transformer.set_attention_backend(cfg.attention_backend)
     for p in transformer.parameters():
@@ -617,7 +644,48 @@ def main() -> None:
 
     base_prompt = torch.zeros((cfg.prompt_len, 2560), device=cfg.device, dtype=transformer.dtype)
 
-    for step in range(cfg.steps):
+    start_step = 0
+    if cfg.resume is not None:
+        ckpt = torch.load(str(cfg.resume), map_location="cpu")
+        ckpt_token_count = int(ckpt.get("token_count", cfg.token_count))
+        if ckpt_token_count != cfg.token_count:
+            raise SystemExit(f"resume token_count mismatch: expected {cfg.token_count}, got {ckpt_token_count}")
+        state = ckpt.get("state_dict")
+        if not isinstance(state, dict):
+            raise SystemExit("resume checkpoint missing state_dict")
+        adapter.load_state_dict(state, strict=True)
+        opt_state = ckpt.get("optimizer")
+        if isinstance(opt_state, dict):
+            try:
+                opt.load_state_dict(opt_state)
+            except Exception:
+                print("[train] resume: optimizer state could not be loaded; continuing with fresh optimizer.")
+        start_step = int(ckpt.get("step", 0))
+        if start_step < 0:
+            start_step = 0
+        print(f"[train] resumed from {cfg.resume} at step={start_step}")
+
+    def _save_checkpoint(path: Path, step_idx: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        torch.save(
+            {
+                "step": int(step_idx),
+                "token_count": cfg.token_count,
+                "token_scale": cfg.token_scale,
+                "prompt_len": cfg.prompt_len,
+                "state_dict": adapter.state_dict(),
+                "optimizer": opt.state_dict(),
+            },
+            str(tmp),
+        )
+        tmp.replace(path)
+
+    run_start = time.perf_counter()
+    ema_step_s: float | None = None
+
+    for step in range(start_step, cfg.steps):
+        step_start = time.perf_counter()
         opt.zero_grad(set_to_none=True)
 
         images_rgb = []
@@ -715,16 +783,30 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(adapter.parameters(), cfg.grad_clip)
         opt.step()
 
-        if (step + 1) % 5 == 0 or step == 0:
-            print(f"[train] step {step+1}/{cfg.steps} loss={loss.item():.6f}")
+        step_s = time.perf_counter() - step_start
+        if ema_step_s is None:
+            ema_step_s = step_s
+        else:
+            # Smooth per-step time (helps ETA not jump around).
+            ema_step_s = 0.95 * ema_step_s + 0.05 * step_s
 
-    torch.save(
-        {
-            "token_count": cfg.token_count,
-            "state_dict": adapter.state_dict(),
-        },
-        str(cfg.output),
-    )
+        if (step + 1) % 5 == 0 or step == 0:
+            eta_s = (cfg.steps - (step + 1)) * (ema_step_s or step_s)
+            elapsed_s = time.perf_counter() - run_start
+            print(
+                f"[train] step {step+1}/{cfg.steps} "
+                f"loss={loss.item():.6f} "
+                f"dt={step_s:.3f}s "
+                f"avg_dt={((ema_step_s or step_s)):.3f}s "
+                f"elapsed={elapsed_s/60.0:.1f}m "
+                f"eta={eta_s/3600.0:.1f}h"
+            )
+        if cfg.save_every > 0 and (step + 1) % cfg.save_every == 0:
+            ckpt_path = cfg.output.with_suffix(f".step{step+1}.pth")
+            _save_checkpoint(ckpt_path, step + 1)
+            print(f"[train] checkpoint {ckpt_path}")
+
+    _save_checkpoint(cfg.output, cfg.steps)
     print(f"[train] saved {cfg.output}")
 
 
