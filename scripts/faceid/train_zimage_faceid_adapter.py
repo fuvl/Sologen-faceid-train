@@ -6,6 +6,7 @@ import hashlib
 import random
 import sys
 import time
+from contextlib import nullcontext
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -448,7 +449,7 @@ def main() -> None:
     parser.add_argument(
         "--attention-backend",
         default=None,
-        help="Optional attention backend for Z-Image transformer (e.g. 'flash', '_flash_3').",
+        help="Attention backend for Z-Image transformer (e.g. 'native', '_native_flash', '_native_efficient').",
     )
     parser.add_argument(
         "--prompt-mode",
@@ -529,6 +530,11 @@ def main() -> None:
         # bfloat16 support is spotty outside CUDA; fall back to fp16/fp32.
         dtype = torch.float16 if device.type == "mps" else torch.float32
 
+    attention_backend = args.attention_backend
+    if attention_backend is None and device.type == "cuda":
+        # Default to a memory-efficient SDPA kernel for training.
+        attention_backend = "_native_flash"
+
     cfg = TrainConfig(
         repo=args.repo,
         cache_dir=cache_dir,
@@ -548,7 +554,7 @@ def main() -> None:
         lr=args.lr,
         device=device,
         dtype=dtype,
-        attention_backend=args.attention_backend,
+        attention_backend=attention_backend,
         prompt_mode=args.prompt_mode or ("celeba_attrs" if args.hf_dataset else "zeros"),
         prompt_cache_size=args.prompt_cache_size,
         text_encoder_on_cpu=args.text_encoder_on_cpu,
@@ -609,8 +615,6 @@ def main() -> None:
     transformer.eval()
     if cfg.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
-    if cfg.attention_backend:
-        transformer.set_attention_backend(cfg.attention_backend)
     for p in transformer.parameters():
         p.requires_grad_(False)
 
@@ -701,8 +705,15 @@ def main() -> None:
         )
         tmp.replace(path)
 
+    try:
+        from diffusers.models.attention_dispatch import attention_backend as attention_backend_ctx  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise SystemExit("diffusers attention backend support is required; please update diffusers.") from e
+
     run_start = time.perf_counter()
     ema_step_s: float | None = None
+
+    attn_backend_name = cfg.attention_backend
 
     for step in range(start_step, cfg.steps):
         step_start = time.perf_counter()
@@ -783,7 +794,8 @@ def main() -> None:
 
         latent_model_input_list = list(noisy_latents.to(dtype=transformer.dtype).unsqueeze(2).unbind(dim=0))
 
-        out_list = transformer(latent_model_input_list, t, prompt_embeds_list, return_dict=False)[0]
+        with (attention_backend_ctx(attn_backend_name) if attn_backend_name else nullcontext()):
+            out_list = transformer(latent_model_input_list, t, prompt_embeds_list, return_dict=False)[0]
         out = torch.stack(out_list, dim=0).squeeze(2).float()
 
         # Pipeline negates model output before scheduler step.
