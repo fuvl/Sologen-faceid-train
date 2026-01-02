@@ -794,23 +794,25 @@ def main() -> None:
 
         latent_model_input_list = list(noisy_latents.to(dtype=transformer.dtype).unsqueeze(2).unbind(dim=0))
 
+        # Keep the attention backend context active for both forward and backward recomputation
+        # when gradient checkpointing is enabled.
         with (attention_backend_ctx(attn_backend_name) if attn_backend_name else nullcontext()):
             out_list = transformer(latent_model_input_list, t, prompt_embeds_list, return_dict=False)[0]
-        out = torch.stack(out_list, dim=0).squeeze(2).float()
+            out = torch.stack(out_list, dim=0).squeeze(2).float()
 
-        # Pipeline negates model output before scheduler step.
-        pred_v = -out  # keep fp32 for stable loss
-        loss = torch.mean((pred_v - target_v) ** 2)
-        if not torch.isfinite(loss).item():
-            print("[train] ERROR: non-finite loss; aborting.")
-            print(_tensor_stats("latents", latents))
-            print(_tensor_stats("noise", noise))
-            print(_tensor_stats("noisy_latents", noisy_latents))
-            print(_tensor_stats("tokens", tokens))
-            print(_tensor_stats("out", out))
-            print(_tensor_stats("target_v", target_v))
-            raise SystemExit(2)
-        loss.backward()
+            # Pipeline negates model output before scheduler step.
+            pred_v = -out  # keep fp32 for stable loss
+            loss = torch.mean((pred_v - target_v) ** 2)
+            if not torch.isfinite(loss).item():
+                print("[train] ERROR: non-finite loss; aborting.")
+                print(_tensor_stats("latents", latents))
+                print(_tensor_stats("noise", noise))
+                print(_tensor_stats("noisy_latents", noisy_latents))
+                print(_tensor_stats("tokens", tokens))
+                print(_tensor_stats("out", out))
+                print(_tensor_stats("target_v", target_v))
+                raise SystemExit(2)
+            loss.backward()
         if cfg.grad_clip and cfg.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(adapter.parameters(), cfg.grad_clip)
         opt.step()
