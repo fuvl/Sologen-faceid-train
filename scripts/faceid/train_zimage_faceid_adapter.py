@@ -35,6 +35,7 @@ class TrainConfig:
     height: int
     width: int
     prompt_len: int
+    prompt_template: str
     token_count: int
     lr: float
     device: torch.device
@@ -305,17 +306,24 @@ class _PromptEmbedCache:
             self._items.popitem(last=False)
 
 
+def wrap_zimage_prompt(prompt: str) -> str:
+    # Qwen chat-format prompt template used by Z-Image Turbo.
+    return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+
+
 class _ZImageTextEncoder:
     def __init__(
         self,
         repo: str,
         cache_dir: Path | None,
         prompt_len: int,
+        prompt_template: str,
         device: torch.device,
         dtype: torch.dtype,
         on_cpu: bool,
     ) -> None:
         self.prompt_len = int(prompt_len)
+        self.prompt_template = str(prompt_template)
         model_device = torch.device("cpu") if on_cpu else device
 
         tokenizer_kwargs = {
@@ -353,8 +361,11 @@ class _ZImageTextEncoder:
 
     @torch.inference_mode()
     def encode(self, prompt: str) -> torch.Tensor:
+        if self.prompt_template == "zimage_chat":
+            prompt = wrap_zimage_prompt(prompt)
         tok = self.tokenizer(
             prompt,
+            add_special_tokens=False,
             padding="max_length",
             truncation=True,
             max_length=self.prompt_len,
@@ -424,6 +435,12 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--width", type=int, default=512)
     parser.add_argument("--prompt-len", type=int, default=16)
+    parser.add_argument(
+        "--prompt-template",
+        choices=["zimage_chat", "plain"],
+        default="zimage_chat",
+        help="Text prompt template used before tokenization. Must match your runtime for FaceID to work.",
+    )
     parser.add_argument("--token-count", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default="auto")
@@ -526,6 +543,7 @@ def main() -> None:
         height=args.height,
         width=args.width,
         prompt_len=args.prompt_len,
+        prompt_template=args.prompt_template,
         token_count=args.token_count,
         lr=args.lr,
         device=device,
@@ -569,6 +587,7 @@ def main() -> None:
     print(f"[train] dtype={cfg.dtype}")
     print(f"[train] attention_backend={cfg.attention_backend}")
     print(f"[train] prompt_mode={cfg.prompt_mode}")
+    print(f"[train] prompt_template={cfg.prompt_template}")
     print(f"[train] prompt_cache_size={cfg.prompt_cache_size}")
     print(f"[train] text_encoder_on_cpu={cfg.text_encoder_on_cpu}")
     print(f"[train] token_scale={cfg.token_scale}")
@@ -613,6 +632,7 @@ def main() -> None:
             repo=cfg.repo,
             cache_dir=cfg.cache_dir,
             prompt_len=cfg.prompt_len,
+            prompt_template=cfg.prompt_template,
             device=cfg.device,
             dtype=cfg.dtype,
             on_cpu=cfg.text_encoder_on_cpu,
